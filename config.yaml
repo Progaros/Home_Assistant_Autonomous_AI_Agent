@@ -1,0 +1,115 @@
+template:
+  # 1. Weather Text (Legacy)
+  - trigger:
+      - trigger: event
+        event_type: set_weather_text
+    sensor:
+      - name: Weather Text
+        unique_id: weather_text_legacy
+        state: "{{ now().isoformat() }}"
+        attributes:
+          payload: "{{ trigger.event.data.payload }}"
+
+  # 2. Personalized Text (For display & history)
+  - trigger:
+      - trigger: event
+        event_type: set_personalized_text
+    sensor:
+      - name: Personalized Text
+        unique_id: personalized_text
+        state: "{{ now().isoformat() }}"
+        attributes:
+          payload: "{{ trigger.event.data.payload | default('Waiting...') }}"
+          history: >
+            {% set current = [] %}
+            {% if this is defined and this is not none and this.attributes is defined %}
+               {% set val = this.attributes.history %}
+               {% if val is iterable and val is not string %}
+                 {% set current = val %}
+               {% endif %}
+            {% endif %}
+            {% set new_val = trigger.event.data.payload | default('DATA_MISSING') %}
+            {% set new_entry = {"time": now().strftime('%H:%M'), "text": new_val} %}
+            {{ (current + [new_entry])[-10:] }}
+
+  # 3. AI Memory Store (For long-term facts & corrections)
+  - trigger:
+      - trigger: event
+        event_type: set_ai_memory
+    sensor:
+      - name: "AI Memory Store"
+        unique_id: ai_memory_store
+        icon: mdi:brain
+        state: "{{ now().isoformat() }}"
+        attributes:
+          # Long-term Facts
+          learned_facts: >
+            {% set current = "Noch nichts gelernt." %}
+            {% if this is defined and this is not none and this.attributes is defined %}
+              {% set current = this.attributes.learned_facts | default(current) %}
+            {% endif %}
+            {% set new = trigger.event.data.get('new_fact', '') | string %}
+            {% if new | length > 0 %}
+              {% if current == "Noch nichts gelernt." %}
+                {{ '- ' ~ new }}
+              {% else %}
+                {{ ('- ' ~ new ~ '\n' ~ current) | truncate(2000, true, '...') }}
+              {% endif %}
+            {% else %}
+              {{ current }}
+            {% endif %}
+
+          # User Corrections
+          correction_log: >
+            {% set current = [] %}
+            {% if this is defined and this is not none and this.attributes is defined %}
+              {% set val = this.attributes.correction_log %}
+              {% if val is string %}
+                {% set current = val | from_json %}
+              {% else %}
+                {% set current = val | default([]) %}
+              {% endif %}
+            {% endif %}
+            {% set new = trigger.event.data.get('new_correction', '') | string %}
+            {% if new | length > 0 %}
+              {% set entry = {'time': now().strftime('%d.%m %H:%M'), 'text': new} %}
+              {{ (current + [entry])[-5:] | tojson }}
+            {% else %}
+              {{ current | tojson }}
+            {% endif %}
+
+          # Agent run statistics
+          last_run: >
+            {% if trigger.event.data.get('agent_status') %}
+              {{ now().strftime('%d.%m.%Y %H:%M') }}
+            {% elif this is defined and this.attributes is defined %}
+              {{ this.attributes.last_run | default('Never') }}
+            {% else %}
+              Never
+            {% endif %}
+
+          last_status: >
+            {% set status = trigger.event.data.get('agent_status', '') %}
+            {% if status | length > 0 %}
+              {{ status }}
+            {% elif this is defined and this.attributes is defined %}
+              {{ this.attributes.last_status | default('UNKNOWN') }}
+            {% else %}
+              UNKNOWN
+            {% endif %}
+
+          tools_history: >
+            {% set current = [] %}
+            {% if this is defined and this is not none and this.attributes is defined %}
+              {% set val = this.attributes.get('tools_history', []) %}
+              {% if val is iterable and val is not string %}
+                {% set current = val %}
+              {% endif %}
+            {% endif %}
+            {% set tools = trigger.event.data.get('tools_used', '') %}
+            {% if tools | length > 0 %}
+              {% set entry = {'time': now().strftime('%H:%M'), 'tools': tools, 'iterations': trigger.event.data.get('iterations', 0)} %}
+              {{ (current + [entry])[-5:] }}
+            {% else %}
+              {{ current }}
+            {% endif %}

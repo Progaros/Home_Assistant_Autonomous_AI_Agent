@@ -1,0 +1,88 @@
+alias: Assistant Summary Notification with Memory & Tools
+description: ""
+triggers:
+  - trigger: time_pattern
+    hours: "*"
+    enabled: true
+    id: "Scheduled Run "
+    minutes: "14"
+  - trigger: state
+    entity_id:
+      - binary_sensor.pc
+    to:
+      - "on"
+    for:
+      hours: 0
+      minutes: 10
+      seconds: 0
+    enabled: false
+  - trigger: time
+    at:
+      entity_id: sensor.phone_next_alarm
+      offset: "-00:10:00"
+conditions: []
+actions:
+  - alias: Don't run if PC is off & triggered by schedule
+    if:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: switch.computer
+            state:
+              - "on"
+            for:
+              hours: 0
+              minutes: 20
+              seconds: 0
+      - condition: trigger
+        id:
+          - "Scheduled Run "
+    then:
+      - stop: Pc is offline
+  - alias: Turn on PC if it is off
+    if:
+      - condition: state
+        entity_id: switch.computer
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.gast_modus
+        state: "off"
+    then:
+      - metadata: {}
+        data: {}
+        target:
+          entity_id: switch.computer
+        action: switch.turn_on
+      - wait_for_trigger:
+          - trigger: state
+            entity_id:
+              - switch.computer
+            to:
+              - "on"
+            for:
+              hours: 0
+              minutes: 0
+              seconds: 30
+        continue_on_timeout: true
+        timeout:
+          hours: 0
+          minutes: 5
+          seconds: 0
+          milliseconds: 0
+      - variables:
+          pc_turned_on_for_this: true
+    enabled: true
+
+  - alias: 🤖 Run Python Agent
+    action: python_script.agent
+
+  - alias: Shutdown PC if it was turned on for this
+    if:
+      - condition: template
+        value_template: "{{ pc_turned_on_for_this | default(false) }}"
+    then:
+      - action: notify.mobile_app_phone
+        data:
+          title: "Tagesübersicht"
+          message: "Agent completed - PC wird heruntergefahren"
+      - action: shell_command.shutdown_pc
