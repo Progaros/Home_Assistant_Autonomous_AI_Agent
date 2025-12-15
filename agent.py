@@ -307,11 +307,8 @@ MAX_CONSECUTIVE_ERRORS = 5
 # Maximum times to retry a failed tool before suggesting alternatives
 MAX_TOOL_RETRIES = 2
 
-# Maximum DRAFT iterations for message refinement
-MAX_REVIEW_ITERATIONS = 3
-
 # Number of personas to use for draft generation (3-5 recommended)
-NUM_DRAFT_PERSONAS = 5
+NUM_DRAFT_PERSONAS = 3
 
 # --- MEMORY LIMITS ---
 # Maximum length for a single saved fact
@@ -376,6 +373,22 @@ FACT_BLOCKLIST = [
 ]
 
 # -------------------------------------------------------
+# FORMATTING RULES (reused across prompts)
+# -------------------------------------------------------
+# These rules are included in persona prompts, merge prompts, and tool descriptions
+# to ensure consistent plain-text output without markdown formatting.
+# -------------------------------------------------------
+
+PLAIN_TEXT_RULES = """PLAIN TEXT ONLY - NO FORMATTING!
+- NO ** for bold
+- NO * for italic or bullets  
+- NO ## for headers
+- NO ``` for code blocks
+- Use plain dashes (-) for lists
+- Example: "- Task 1" NOT "**Task 1**" or "* Task 1"
+"""
+
+# -------------------------------------------------------
 # SYSTEM PROMPT
 # -------------------------------------------------------
 # This is the main instruction set for the LLM. It defines:
@@ -408,10 +421,15 @@ Analyze the situation, detect problems/opportunities, act autonomously, and info
 4. PLAN multi-step actions ahead
 5. INFORM the user with a useful summary
 
-## PROACTIVE ACTIONS (execute AUTOMATICALLY when sensible)
-- CO2 > 1000ppm? -> URGENT_ALERT, suggest ventilation
-- Appointment in < 1h? -> Check S-Bahn, calculate departure time
-- Birthday today? -> Mention it prominently
+## PROACTIVE ACTIONS (when genuinely needed)
+- URGENT situations ONLY: Fire, intrusion, sensor alarms -> URGENT_ALERT
+- Appointment in < 1h? -> Check S-Bahn for relevant time, calculate departure
+- Birthday today? -> Mention it
+
+## IMPORTANT: DATA ALREADY PROVIDED
+You receive sensor data (CO2, temperature, etc.) automatically in context.
+Do NOT use GET_ENTITY_STATE for sensors already shown in context!
+Only use GET_ENTITY_STATE for entities NOT in your context.
 
 ## TOOL CHAINING (use multiple tools sequentially)
 Example chains:
@@ -423,7 +441,7 @@ Example chains:
 ### Planning Tools
 PLAN: Create a multi-step action plan BEFORE acting.
   - WHEN: ONLY at the start for complex tasks
-  - CONTENT: List of steps (e.g. "1. Check CO2 | 2. Check windows | 3. FINISH")
+  - CONTENT: List of steps (e.g. "1. Check weather | 2. Check S-Bahn | 3. DRAFT | 4. FINISH")
   - IMPORTANT: After PLAN execute each step with the APPROPRIATE tool!
   - NEVER create a new PLAN while one is running!
 
@@ -433,11 +451,12 @@ READ_MEMORY: Load stored user preferences and corrections.
 
 GET_ENTITY_STATE: Read current state of a device/sensor.
   - CONTENT: entity_id (e.g. "binary_sensor.fenster_wohnzimmer")
-  - ONLY for READING - not for controlling!
-
+  - ONLY for entities NOT already in your context!
+  - Sensor data (CO2, temperature) is already provided - don't re-fetch!
 GET_SBAHN: Get S-Bahn departure times.
-  - CONTENT: "home" or "hbf" (direction)
-  - Returns next 3 departures
+  - CONTENT: "home" or station ID
+  - Returns next 3 departures FROM NOW (not future times!)
+  - Only useful for immediate travel planning, not for tomorrow's appointments
 
 GET_WEATHER: Get full weather forecast (48h hourly + weekly).
   - CONTENT: (leave empty)
@@ -449,7 +468,6 @@ SEARCH_WEB: Search for external information.
 
 CALCULATE: Mathematical calculations.
   - CONTENT: Expression (e.g. "45 + 15")
-
 ### Action Tools (for CONTROLLING)
 CONTROL_DEVICE: Control devices (NOT for reading!).
   - CONTENT: entity_id|action|[params]
@@ -461,22 +479,23 @@ CONTROL_DEVICE: Control devices (NOT for reading!).
 SAVE_FACT: Save important user info permanently.
   - CONTENT: Fact (only personal preferences, NO sensor data!)
 
-URGENT_ALERT: ONLY for real emergencies (CO2>1000, intrusion, fire).
+URGENT_ALERT: ONLY for real emergencies (intrusion, fire, critical sensor alarms).
   - CONTENT: Alert message
+  - Use sparingly! Most situations don't need urgent alerts.
 
 ### Completion Tools
 DRAFT: Generate persona-based drafts and merge into final message.
-  - CONTENT: ONLY bullet points of RAW FACTS to mention (from tool results!)
+  - CONTENT: ONLY bullet points of RAW FACTS to mention (from context/tool results!)
   - Format: "- Fact 1\n- Fact 2\n- Fact 3" (NO prose, NO sentences!)
-  - DO NOT write a message - just list facts from GET_ENTITY_STATE, GET_WEATHER, etc.
+  - DO NOT write a message - just list facts from context or GET_WEATHER, etc.
   - WRONG: "{USER_NAME}, heute Abend war es klar..." (this is a message!)
-  - RIGHT: "- Weather: clear, 5°C\n- CO2: 912 ppm\n- Tomorrow: Termin mit Ernst"
+  - RIGHT: "- Weather: clear, 5°C\n- Tomorrow: Termin 14:00\n- Task due: Abrechnung"
   - System generates different persona messages from your bullet points
   - Returns merged best-of-all draft for your review
 
 FINISH: Send final message to user.
   - CONTENT: Message (max 500 chars, plain text + 1-3 emojis)
-  - NO Markdown, NO HTML!
+  - NO FORMATTING: No **, no *, no ##, no ```. Use - for lists.
 
 ## DECISION LOGIC
 
@@ -485,7 +504,12 @@ FIRST STEP (ALWAYS!):
     -> READ_MEMORY (unless already done this session)
     -> User preferences are stored here!
 
-THEN:
+GATHER DATA BEFORE DRAFTING:
+    -> Use GET_ENTITY_STATE for sensors you need
+    -> Use GET_WEATHER for weather details
+    -> Use GET_SBAHN for transport info
+    -> ONLY after gathering enough context -> DRAFT -> FINISH
+
 IF critical_sensor_alarm:
     -> URGENT_ALERT immediately
 ELIF action_needed_detected:
@@ -494,6 +518,12 @@ ELIF action_needed_detected:
 ELSE:
     -> Analyze context -> DRAFT helpful message -> FINISH
 ```
+
+## EFFICIENCY RULES
+1. READ entities BEFORE drafting - don't guess!
+2. DRAFT only ONCE - it auto-cleans formatting
+3. FINISH immediately after DRAFT - no revision loops
+4. Use GET_ENTITY_STATE for multiple sensors if needed
 
 ## USER CORRECTIONS (HIGHEST PRIORITY!)
 Corrections in Memory are COMMANDS for FUTURE behavior!
@@ -764,6 +794,51 @@ def is_fact_blocked(content):
             pass
     return False
 
+
+def strip_markdown(content):
+    """Remove common markdown formatting from text.
+    
+    Strips bold (**), italic (*), headers (##), code blocks (```),
+    and converts markdown bullets to plain dashes.
+    
+    Args:
+        content: Text that may contain markdown
+    
+    Returns:
+        Plain text version of the content
+    """
+    text = str(content)
+    
+    # Remove bold/italic markers (** and *)
+    while "**" in text:
+        text = text.replace("**", "")
+    
+    # Remove header markers
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        # Remove leading # symbols from headers
+        stripped = line.lstrip()
+        while stripped.startswith("#"):
+            stripped = stripped[1:].lstrip()
+        # Convert * bullets to - bullets
+        if stripped.startswith("* "):
+            stripped = "- " + stripped[2:]
+        cleaned_lines.append(stripped)
+    text = "\n".join(cleaned_lines)
+    
+    # Remove code block markers
+    text = text.replace("```", "")
+    
+    # Remove inline code backticks
+    text = text.replace("`", "")
+    
+    # Clean up multiple spaces
+    while "  " in text:
+        text = text.replace("  ", " ")
+    
+    return text.strip()
+
 def validate_message(content):
     """Validate a message for REVIEW/FINISH.
     
@@ -811,56 +886,6 @@ def validate_message(content):
         issues.append("Contains escape sequences (use actual line breaks if needed)")
     
     return issues
-
-def verify_language(content, expected_language):
-    """
-    Use AI to verify that the message is in the expected language.
-    
-    Args:
-        content: The message text to verify
-        expected_language: The expected language (e.g., "German")
-    
-    Returns:
-        Tuple of (is_correct: bool, feedback: str)
-    """
-    if not content or len(content) < 10:
-        return True, ""  # Too short to verify
-    
-    try:
-        verify_prompt = """<SYSTEM>
-LANGUAGE VERIFICATION MODE.
-Expected language: """ + expected_language + """
-Message to verify: """ + content + """
-
-Is this message written in """ + expected_language + """?
-Ignore common loanwords, brand names, or technical terms.
-Focus on whether the main text is in the correct language.
-
-Answer format:
-LANGUAGE_OK: YES or NO
-ISSUE: (only if NO - briefly explain what language it appears to be)
-</SYSTEM>"""
-        
-        verify_call = hass.services.call(
-            "ai_task", "generate_data",
-            {"entity_id": LLM_ENTITY, "task_name": "Verify Language", "instructions": verify_prompt},
-            blocking=True, return_response=True
-        )
-        verify_res = str(verify_call.get("data", "")).strip().upper()
-        
-        if "LANGUAGE_OK: YES" in verify_res or "YES" in verify_res.split("\n")[0]:
-            return True, ""
-        else:
-            # Extract issue if present
-            issue = "Message appears to be in wrong language. Please rewrite in " + expected_language + "."
-            if "ISSUE:" in verify_res:
-                issue_line = verify_res.split("ISSUE:")[1].strip().split("\n")[0]
-                if issue_line:
-                    issue = "Language issue: " + issue_line + ". Please rewrite in " + expected_language + "."
-            return False, issue
-    except Exception as e:
-        log_warn("Language verification failed: " + str(e), 0)
-        return True, ""  # Don't block on verification errors
 
 
 # -------------------------------------------------------
@@ -943,15 +968,14 @@ CRITICAL RULES:
 1. ONLY mention facts that appear in RAW FACTS or VERIFIED DATA above
 2. Do NOT add information that is not explicitly listed
 3. Do NOT assume sleeping times, appointments, or events unless listed
-4. Do NOT say "you usually sleep at..." unless it's in the data
-5. If you're unsure about something, OMIT it rather than guess
-6. Write in """ + language + """
-7. Maximum 400 characters
-8. Plain text only (no markdown, no HTML)
+4. If you're unsure about something, OMIT it rather than guess
+5. Write in """ + language + """
+6. Maximum 400 characters
+7. """ + PLAIN_TEXT_RULES + """
 
 FORMAT YOUR RESPONSE EXACTLY:
 ---DRAFT---
-[Your draft message here]
+[Your draft message here - PLAIN TEXT ONLY]
 ---END---
 </SYSTEM>"""
 
@@ -972,6 +996,9 @@ FORMAT YOUR RESPONSE EXACTLY:
                 else:
                     # Fallback: use raw output
                     draft_text = draft_raw.strip()[:400]
+                
+                # Auto-strip markdown from persona draft
+                draft_text = strip_markdown(draft_text)
                 
                 persona_drafts.append({
                     "persona": persona["name"],
@@ -1069,18 +1096,15 @@ Max Length: 500 characters
 INPUT DRAFTS:""" + drafts_for_merge + corrections_instruction + """
 
 YOUR TASK:
-1. Identify the BEST elements from each draft:
-   - Best opening/greeting
-   - Most useful information
-   - Best tone/warmth balance
-   - Best emoji usage (1-3 total)
+1. Identify the BEST elements from each draft (greeting, info, tone, emojis)
 2. Combine into ONE optimal message
 3. Ensure it's natural, not a Frankenstein patchwork
-4. Keep it under 500 chars, plain text only
+4. """ + PLAIN_TEXT_RULES + """
+5. Keep it under 500 chars
 
 FORMAT:
 ---MERGED---
-[Your merged optimal message here]
+[Your merged message - PLAIN TEXT, no formatting]
 ---NOTES---
 [Brief notes on what you took from each persona]
 </SYSTEM>"""
@@ -1110,6 +1134,8 @@ FORMAT:
             merged_draft = persona_drafts[0]["draft"] if persona_drafts else topic
             log_warn("MERGE: Fallback to first draft (parsing failed)", 0)
         else:
+            # Auto-strip any markdown that slipped through
+            merged_draft = strip_markdown(merged_draft)
             log_msg("MERGED DRAFT: " + merged_draft[:LOG_CONTENT_PREVIEW], 0)
             if merge_notes:
                 log_msg("MERGE NOTES: " + merge_notes[:150], 0)
@@ -1743,13 +1769,12 @@ if mem_critical:
 #   current_plan: Multi-step plan if PLAN tool was used
 #   plan_index: Current step in the plan
 #   alert_sent: Prevents multiple alerts in one session
-#   draft_count: Tracks DRAFT iterations (max MAX_REVIEW_ITERATIONS)
+#   draft_count: Tracks DRAFT uses (just for logging)
 #   consecutive_errors: For graceful failure after MAX_CONSECUTIVE_ERRORS
 agent_state = {
     "history": [],
     "tool_sequence": [],
     "final_message": None,
-    "review_passed": False,
     "memory_read": False,
     "alert_sent": False,
     "consecutive_errors": 0,
@@ -1763,7 +1788,6 @@ agent_state = {
     "suggested_alternatives": [],
     "draft_count": 0,
     "last_draft": None,
-    "draft_feedback": [],
     "persona_drafts": [],  # Stores individual persona drafts from DRAFT tool
 }
 
@@ -2244,34 +2268,62 @@ for i in range(MAX_ITERATIONS):
             if not content:
                 new_step["result"] = "Error: No entity_id provided in CONTENT."
             else:
-                entity_id = validate_entity_id(content)
-                if not entity_id:
-                    new_step["result"] = "Error: Invalid entity_id format: " + content
-                    set_retry_state(agent_state, "GET_ENTITY_STATE")
+                # Handle multiple entities: split by comma, newline, or space
+                raw_content = content.replace("\n", ",").replace(" ", ",")
+                entity_candidates = [e.strip() for e in raw_content.split(",") if e.strip()]
+                
+                # If only one candidate, use it directly
+                if len(entity_candidates) == 1:
+                    entity_ids = [entity_candidates[0]]
                 else:
+                    # Multiple entities requested - validate each
+                    entity_ids = []
+                    for candidate in entity_candidates[:5]:  # Limit to 5 entities max
+                        validated = validate_entity_id(candidate)
+                        if validated:
+                            entity_ids.append(validated)
+                
+                if not entity_ids:
+                    # Try to validate the whole content as single entity
+                    single_id = validate_entity_id(content.strip())
+                    if single_id:
+                        entity_ids = [single_id]
+                    else:
+                        new_step["result"] = "Error: No valid entity_id found in: " + content[:100] + ". Use format: sensor.name or light.name"
+                        set_retry_state(agent_state, "GET_ENTITY_STATE")
+                        agent_history.append(new_step)
+                        enforce_history_limit()
+                        continue
+                
+                # Process each entity
+                results = []
+                for entity_id in entity_ids:
                     state_info = get_state(entity_id)
                     if state_info:
                         attrs_str = str(state_info["attributes"])
-                        if len(attrs_str) > ATTRS_PREVIEW_LENGTH:
-                            attrs_str = attrs_str[:ATTRS_PREVIEW_LENGTH] + "..."
+                        if len(attrs_str) > ATTRS_PREVIEW_LENGTH // len(entity_ids):
+                            attrs_str = attrs_str[:ATTRS_PREVIEW_LENGTH // len(entity_ids)] + "..."
                         # Add actionable hints based on state
                         action_hint = ""
                         state_val = state_info['state'].lower()
                         if state_val == "on" and "light" in entity_id:
-                            action_hint = " Light is ON. Turn off if not needed?"
+                            action_hint = " (Light ON)"
                         elif state_val == "open" and ("window" in entity_id or "fenster" in entity_id):
-                            action_hint = " Window is OPEN. Check weather/CO2."
-                        new_step["result"] = "State: " + entity_id + " = " + state_info['state'] + " | Attrs: " + attrs_str + action_hint
+                            action_hint = " (Window OPEN)"
+                        results.append(entity_id + " = " + state_info['state'] + action_hint)
                         agent_state["actions_taken"].append("Checked " + entity_id)
-                        clear_retry_state(agent_state)
                     else:
-                        new_step["result"] = "Error: Entity '" + entity_id + "' not found."
-                        set_retry_state(agent_state, "GET_ENTITY_STATE")
-                        domain = entity_id.split(".")[0] if "." in entity_id else ""
-                        new_step["result"] = new_step["result"] + " Try a different " + domain + " entity, or continue."
-                    
-                    # Always advance plan
-                    new_step["result"] = new_step["result"] + advance_plan(agent_state)
+                        results.append(entity_id + " = NOT FOUND")
+                
+                if results:
+                    new_step["result"] = "States: " + " | ".join(results)
+                    clear_retry_state(agent_state)
+                else:
+                    new_step["result"] = "Error: No entities found."
+                    set_retry_state(agent_state, "GET_ENTITY_STATE")
+                
+                # Always advance plan
+                new_step["result"] = new_step["result"] + advance_plan(agent_state)
             agent_history.append(new_step)
             enforce_history_limit()
 
@@ -2374,19 +2426,12 @@ for i in range(MAX_ITERATIONS):
             enforce_history_limit()
 
         elif tool == "REVIEW":
-            # REVIEW is now optional - just validate and give feedback
+            # REVIEW is optional - FINISH will auto-clean anyway
             if not content:
                 new_step["result"] = "Error: No draft provided in CONTENT."
             else:
-                issues = validate_message(content)
-                if issues:
-                    new_step["result"] = "Issues found: " + "; ".join(issues) + ". Consider fixing before FINISH."
-                    agent_state["review_passed"] = False
-                    log_msg("REVIEW: Issues - " + "; ".join(issues), iter_num)
-                else:
-                    new_step["result"] = "Looks good (" + str(len(content)) + " chars). Ready to FINISH."
-                    log_msg("REVIEW: Passed (" + str(len(content)) + " chars)", iter_num)
-                    agent_state["review_passed"] = True
+                new_step["result"] = "Draft received (" + str(len(content)) + " chars). Use FINISH to send - formatting will be auto-cleaned."
+                log_msg("REVIEW: " + str(len(content)) + " chars", iter_num)
             agent_history.append(new_step)
             enforce_history_limit()
             
@@ -2434,52 +2479,29 @@ for i in range(MAX_ITERATIONS):
                     RESPONSE_LANGUAGE
                 )
                 
+                # ALWAYS strip markdown from the merged draft immediately
+                original_draft = merged_draft
+                merged_draft = strip_markdown(merged_draft)
+                if merged_draft != original_draft:
+                    log_msg("Auto-stripped markdown from merged draft", iter_num)
+                
+                # Truncate if too long
+                if len(merged_draft) > MAX_MESSAGE_LENGTH:
+                    merged_draft = merged_draft[:MAX_MESSAGE_LENGTH-3] + "..."
+                    log_msg("Auto-truncated draft to " + str(MAX_MESSAGE_LENGTH) + " chars", iter_num)
+                
                 agent_state["last_draft"] = merged_draft
-                agent_state["persona_drafts"] = persona_drafts  # Store for reference
+                agent_state["persona_drafts"] = persona_drafts
                 
-                # Build result with persona previews
-                result_text = "=== PERSONA DRAFTS GENERATED ===\n"
-                for pd in persona_drafts:
-                    preview = pd["draft"][:80] + "..." if len(pd["draft"]) > 80 else pd["draft"]
-                    result_text = result_text + "\n[" + pd["persona"] + "]: " + preview
+                # Build simplified result
+                result_text = "=== DRAFT READY ===\n" + merged_draft
+                result_text = result_text + "\n\n[" + str(len(merged_draft)) + " chars, cleaned, ready to FINISH]"
                 
-                # Show fact-check result
-                result_text = result_text + "\n\n=== FACT CHECK ===\n"
-                if fact_check_result:
-                    result_text = result_text + fact_check_result
-                else:
-                    result_text = result_text + "No fact check performed"
-                
-                result_text = result_text + "\n\n=== MERGED DRAFT ===\n" + merged_draft
-                
-                if merge_notes:
-                    result_text = result_text + "\n\n[Merge notes: " + merge_notes[:100] + "]"
-                
-                # Validate the merged draft
-                issues = validate_message(merged_draft)
-                
-                # Verify language
-                lang_ok = True
-                if not issues:
-                    lang_ok, lang_feedback = verify_language(merged_draft, RESPONSE_LANGUAGE)
-                    if not lang_ok:
-                        issues.append(lang_feedback)
-                
-                result_text = result_text + "\n\n--- REVIEW ---\n"
-                result_text = result_text + "Length: " + str(len(merged_draft)) + " chars\n"
-                
-                if issues:
-                    result_text = result_text + "Issues: " + "; ".join(issues) + "\n"
-                    result_text = result_text + "Action: Edit the merged draft and use DRAFT again, or use FINISH if acceptable."
-                    agent_state["review_passed"] = False
-                    log_msg("DRAFT REVIEW: Issues - " + "; ".join(issues), iter_num)
-                else:
-                    result_text = result_text + "Status: Ready to send!\n"
-                    result_text = result_text + "Action: Use FINISH with the merged draft (copy it exactly or edit slightly)."
-                    agent_state["review_passed"] = True
-                    log_msg("DRAFT REVIEW: Passed (" + str(len(merged_draft)) + " chars, " + RESPONSE_LANGUAGE + ")", iter_num)
+                if fact_check_result and "ERROR" in fact_check_result.upper():
+                    result_text = result_text + "\n\nWARNING: " + fact_check_result
                 
                 new_step["result"] = result_text
+                log_msg("DRAFT: Ready (" + str(len(merged_draft)) + " chars)", iter_num)
                 
             agent_history.append(new_step)
             enforce_history_limit()
@@ -2494,40 +2516,24 @@ for i in range(MAX_ITERATIONS):
                 if agent_state["current_plan"]:
                     agent_state["plan_index"] = len(agent_state["current_plan"])
                 
-                # Auto-validate and fix common issues
-                issues = validate_message(content)
-                if issues:
-                    # Try to auto-fix length issue
-                    if len(content) > MAX_MESSAGE_LENGTH:
-                        content = content[:MAX_MESSAGE_LENGTH-3] + "..."
-                        log_warn("Auto-truncated message to " + str(MAX_MESSAGE_LENGTH) + " chars", iter_num)
-                    
-                    # Check for remaining critical issues
-                    remaining_issues = []
-                    for issue in issues:
-                        if "HTML" in issue or "Markdown" in issue:
-                            remaining_issues.append(issue)
-                    if remaining_issues:
-                        new_step["result"] = "Auto-fix failed for: " + str(remaining_issues) + ". Fix formatting."
-                        agent_history.append(new_step)
-                        enforce_history_limit()
-                        continue
+                # ALWAYS auto-strip markdown and clean up
+                original_content = content
+                content = strip_markdown(content)
+                if content != original_content:
+                    log_msg("Auto-stripped markdown formatting from message", iter_num)
                 
-                # Verify language before sending (if not already verified via DRAFT)
-                if not agent_state["review_passed"]:
-                    lang_ok, lang_feedback = verify_language(content, RESPONSE_LANGUAGE)
-                    if not lang_ok:
-                        new_step["result"] = "LANGUAGE ERROR: " + lang_feedback + " Use DRAFT to revise."
-                        agent_history.append(new_step)
-                        enforce_history_limit()
-                        continue
+                # Auto-truncate if too long
+                if len(content) > MAX_MESSAGE_LENGTH:
+                    content = content[:MAX_MESSAGE_LENGTH-3] + "..."
+                    log_warn("Auto-truncated message to " + str(MAX_MESSAGE_LENGTH) + " chars", iter_num)
                 
                 # Log autonomous actions taken
                 if agent_state["actions_taken"]:
                     log_debug("Autonomous actions this run: " + str(agent_state["actions_taken"]), iter_num)
                 
+                # Accept the message (no more loops or validation - we stripped formatting already)
                 agent_state["final_message"] = content
-                log_msg("FINISH: " + str(len(content)) + " chars (" + RESPONSE_LANGUAGE + ")", iter_num)
+                log_msg("FINISH: " + str(len(content)) + " chars", iter_num)
                 break
             
         else:
